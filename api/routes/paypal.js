@@ -24,17 +24,17 @@ async function getAccessToken() {
   return resp.json();
 }
 
-// Create order (server-side) - accepts amount, currency, description, optional userId and planId
+// Create order (server-side) - accepts amount, currency, description, optional userId and planId and creatorId
 router.post('/create-order', async (req, res) => {
   try {
-    const { amount, currency = 'KES', description = 'LoveLink purchase', userId, planId } = req.body;
+    const { amount, currency = 'KES', description = 'LoveLink purchase', userId, planId, creatorId } = req.body;
     if (!amount) return res.status(400).json({ error: 'amount required' });
 
     const tokenData = await getAccessToken();
     const accessToken = tokenData.access_token;
 
     // include small metadata in custom_id (ensure short)
-    const customId = JSON.stringify({ userId, planId });
+    const customId = JSON.stringify({ userId, planId, creatorId });
 
     // Optional: allow specifying a payee (merchant account email) via env
     const payeeEmail = process.env.PAYPAL_ACCOUNT_EMAIL || null;
@@ -49,8 +49,6 @@ router.post('/create-order', async (req, res) => {
     };
 
     if (payeeEmail) {
-      // When set, instruct PayPal to route payment to this payee email address.
-      // Note: for marketplace/platform use-cases you may need partner attribution or use PayPal for Marketplaces.
       purchaseUnit.payee = { email_address: payeeEmail };
     }
 
@@ -150,39 +148,57 @@ router.post('/webhook', async (req, res) => {
     console.log('Webhook event verified:', event.event_type);
 
     // Handle relevant events
-    if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED' || event.event_type === 'CHECKOUT.ORDER.APPROVED' || event.event_type === 'PAYMENT.CAPTURE.DENIED') {
-      // Extract capture info and custom_id (metadata) if present
+    if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED') {
       const resource = event.resource;
-      let customId = null;
-      if (resource && resource.supplementary_data && resource.supplementary_data.related_ids && resource.supplementary_data.related_ids.order_id) {
-        // fallback
-      }
 
-      // Many events include order or purchase_unit info with custom_id under purchase_units
+      // amount object can be nested differently depending on event
+      const amountObj = resource && resource.amount ? resource.amount : (resource && resource.purchase_units && resource.purchase_units[0] && resource.purchase_units[0].amount);
+      const value = amountObj ? parseFloat(amountObj.value || amountObj.amount || 0) : 0;
+      const currency = amountObj ? (amountObj.currency_code || amountObj.currency) : 'KES';
+
+      // Attempt to read custom_id from resource or parent order
+      let metadata = null;
       try {
-        const pu = resource.purchase_units || (resource.purchase_units && resource.purchase_units[0]) || null;
-        // For capture events, parent order may be in resource.supplementary_data
+        if (resource && resource.custom_id) {
+          metadata = JSON.parse(resource.custom_id);
+        } else if (resource && resource.links) {
+          // nothing
+        }
       } catch (e) {
-        // ignore
+        metadata = null;
       }
 
-      // For simplicity, record a generic Purchase entry when capture completed
-      if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED') {
-        const captureId = resource && resource.id;
-        const amountObj = resource && resource.amount ? resource.amount : (resource && resource.purchase_units && resource.purchase_units[0] && resource.purchase_units[0].amount);
-        const value = amountObj ? parseFloat(amountObj.value || amountObj.amount || 0) : 0;
-        const currency = amountObj ? (amountObj.currency_code || amountObj.currency) : 'KES';
+      // If metadata contains creatorId, it's a creator-directed payment/gift: create CreatorEarning
+      if (metadata && metadata.creatorId) {
+        const creatorId = Number(metadata.creatorId);
+        const platformCut = Math.round((value * 0.20) * 100) / 100; // 20% rounded to 2 decimals
+        const creatorShare = Math.round((value - platformCut) * 100) / 100;
 
-        // Attempt to read custom_id from the order (if sent in custom_id on purchase_unit)
-        let metadata = null;
-        try {
-          if (resource && resource.custom_id) {
-            metadata = JSON.parse(resource.custom_id);
+        await prisma.creatorEarning.create({
+          data: {
+            creatorId,
+            amount: creatorShare,
+            platformCut,
+            createdAt: new Date()
           }
-        } catch (e) {
-          // ignore
-        }
+        });
 
+        // Also create a Purchase record for auditing
+        await prisma.purchase.create({
+          data: {
+            userId: metadata.userId ? Number(metadata.userId) : null,
+            planId: metadata.planId ? Number(metadata.planId) : null,
+            amount: value,
+            currency,
+            provider: 'paypal',
+            providerId: resource && resource.id ? resource.id : 'unknown',
+            status: 'completed'
+          }
+        });
+
+        console.log(`Recorded CreatorEarning for creator ${creatorId}: amount=${creatorShare} platformCut=${platformCut}`);
+      } else {
+        // Generic purchase: store Purchase record
         await prisma.purchase.create({
           data: {
             userId: metadata && metadata.userId ? Number(metadata.userId) : null,
@@ -190,7 +206,7 @@ router.post('/webhook', async (req, res) => {
             amount: value,
             currency,
             provider: 'paypal',
-            providerId: captureId || (resource && resource.parent_payment) || 'unknown',
+            providerId: resource && resource.id ? resource.id : 'unknown',
             status: 'completed'
           }
         });
