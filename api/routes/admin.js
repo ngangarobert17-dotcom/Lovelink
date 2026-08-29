@@ -27,4 +27,44 @@ router.post('/send-test-email', auth, async (req, res) => {
   }
 });
 
+// Admin-only: list email events with filters and pagination
+router.get('/email-events', auth, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const admin = await prisma.user.findUnique({ where: { id: Number(userId) } });
+    if (!admin || !admin.isAdmin) return res.status(403).json({ error: 'Admin only' });
+
+    const {
+      provider,
+      eventType,
+      from, // ISO date
+      to,   // ISO date
+      page = 1,
+      perPage = 50
+    } = req.query;
+
+    const where = {};
+    if (provider) where.provider = provider;
+    if (eventType) where.eventType = eventType;
+    if (from || to) {
+      where.createdAt = {};
+      if (from) where.createdAt.gte = new Date(from);
+      if (to) where.createdAt.lte = new Date(to);
+    }
+
+    const take = Math.min(200, Number(perPage) || 50);
+    const skip = (Math.max(1, Number(page)) - 1) * take;
+
+    const [total, events] = await Promise.all([
+      prisma.emailEvent.count({ where }),
+      prisma.emailEvent.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take })
+    ]);
+
+    res.json({ total, page: Number(page), perPage: take, events });
+  } catch (err) {
+    console.error('email-events list error', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
