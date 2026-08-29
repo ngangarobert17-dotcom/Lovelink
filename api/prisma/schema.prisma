@@ -98,3 +98,11 @@ model Report {
   reason    String?
   createdAt DateTime @default(now())
 }
+
+model EmailEvent {
+  id        Int      @id @default(autoincrement())
+  provider  String
+  eventType String?
+  payload   Json
+  createdAt DateTime @default(now())
+}
