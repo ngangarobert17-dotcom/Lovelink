@@ -1,9 +1,80 @@
 const express = require('express');
 const { PrismaClient } = require('@prisma/client');
 const auth = require('../middleware/auth');
+const fetch = require('node-fetch');
 
 const prisma = new PrismaClient();
 const router = express.Router();
+
+const PAYPAL_BASE = process.env.PAYPAL_ENV === 'production'
+  ? 'https://api-m.paypal.com'
+  : 'https://api-m.sandbox.paypal.com';
+
+async function getAccessToken() {
+  const client = process.env.PAYPAL_CLIENT_ID;
+  const secret = process.env.PAYPAL_CLIENT_SECRET;
+  if (!client || !secret) throw new Error('Missing PayPal credentials in env');
+
+  const resp = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Basic ' + Buffer.from(client + ':' + secret).toString('base64'),
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'grant_type=client_credentials'
+  });
+  return resp.json();
+}
+
+async function sendPayPalPayout(payoutRequest) {
+  // payoutRequest: { id, userId, amount }
+  // Fetch recipient email
+  const user = await prisma.user.findUnique({ where: { id: Number(payoutRequest.userId) } });
+  if (!user || !user.email) throw new Error('Recipient user or email not found');
+
+  const tokenData = await getAccessToken();
+  const accessToken = tokenData.access_token;
+
+  const senderBatchId = `lovelink-payout-${payoutRequest.id}-${Date.now()}`;
+  const body = {
+    sender_batch_header: {
+      sender_batch_id: senderBatchId,
+      email_subject: 'LoveLink payout',
+      email_message: `You have received a payout from LoveLink (Payout #${payoutRequest.id})`
+    },
+    items: [
+      {
+        recipient_type: 'EMAIL',
+        amount: {
+          value: Number(payoutRequest.amount).toFixed(2),
+          currency: 'KES'
+        },
+        receiver: user.email,
+        note: `Payout #${payoutRequest.id} from LoveLink`,
+        sender_item_id: String(payoutRequest.id)
+      }
+    ]
+  };
+
+  const resp = await fetch(`${PAYPAL_BASE}/v1/payments/payouts`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+
+  const json = await resp.json();
+  if (!resp.ok) {
+    const err = new Error('PayPal Payouts API error');
+    err.details = json;
+    throw err;
+  }
+
+  // Return batch id
+  return json.batch_header && (json.batch_header.payout_batch_id || json.batch_header.batch_id) ? (json.batch_header.payout_batch_id || json.batch_header.batch_id) : null;
+}
 
 // Request a payout (authenticated user)
 router.post('/request', auth, async (req, res) => {
@@ -63,7 +134,7 @@ router.post('/:id/approve', auth, async (req, res) => {
   }
 });
 
-// Admin mark payout paid (finalize)
+// Admin mark payout paid (finalize and attempt PayPal Payout)
 router.post('/:id/mark-paid', auth, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -75,8 +146,18 @@ router.post('/:id/mark-paid', auth, async (req, res) => {
     if (!payout) return res.status(404).json({ error: 'Payout not found' });
     if (payout.status !== 'approved') return res.status(400).json({ error: 'Payout must be approved before marking paid' });
 
-    const updated = await prisma.payoutRequest.update({ where: { id }, data: { status: 'paid' } });
-    res.json(updated);
+    // Attempt to send payout via PayPal Payouts API
+    try {
+      const batchId = await sendPayPalPayout(payout);
+
+      const updated = await prisma.payoutRequest.update({ where: { id }, data: { status: 'paid', provider: 'paypal', providerId: batchId || undefined, paidAt: new Date() } });
+      return res.json(updated);
+    } catch (pErr) {
+      console.error('PayPal payout failed', pErr);
+      // mark as failed and store error info if possible
+      await prisma.payoutRequest.update({ where: { id }, data: { status: 'failed' } });
+      return res.status(500).json({ error: 'PayPal payout failed', details: pErr.details || pErr.message });
+    }
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });

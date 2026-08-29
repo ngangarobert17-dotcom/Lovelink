@@ -84,6 +84,9 @@ model PayoutRequest {
   userId    Int
   amount    Float
   status    String   @default("pending")
+  provider  String?  
+  providerId String?
+  paidAt    DateTime?
   createdAt DateTime @default(now())
   user      User     @relation(fields: [userId], references: [id])
 }
