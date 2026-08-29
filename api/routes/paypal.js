@@ -36,6 +36,24 @@ router.post('/create-order', async (req, res) => {
     // include small metadata in custom_id (ensure short)
     const customId = JSON.stringify({ userId, planId });
 
+    // Optional: allow specifying a payee (merchant account email) via env
+    const payeeEmail = process.env.PAYPAL_ACCOUNT_EMAIL || null;
+
+    const purchaseUnit = {
+      amount: {
+        currency_code: currency,
+        value: amount.toString()
+      },
+      description,
+      custom_id: customId
+    };
+
+    if (payeeEmail) {
+      // When set, instruct PayPal to route payment to this payee email address.
+      // Note: for marketplace/platform use-cases you may need partner attribution or use PayPal for Marketplaces.
+      purchaseUnit.payee = { email_address: payeeEmail };
+    }
+
     const orderResp = await fetch(`${PAYPAL_BASE}/v2/checkout/orders`, {
       method: 'POST',
       headers: {
@@ -44,16 +62,7 @@ router.post('/create-order', async (req, res) => {
       },
       body: JSON.stringify({
         intent: 'CAPTURE',
-        purchase_units: [
-          {
-            amount: {
-              currency_code: currency,
-              value: amount.toString()
-            },
-            description,
-            custom_id: customId
-          }
-        ],
+        purchase_units: [purchaseUnit],
         application_context: {
           brand_name: 'LoveLink',
           user_action: 'PAY_NOW'
