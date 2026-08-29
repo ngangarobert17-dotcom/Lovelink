@@ -2,136 +2,120 @@ const express = require('express');
 const { PrismaClient } = require('@prisma/client');
 const auth = require('../middleware/auth');
 const sendEmail = require('../utils/mailer');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { v4: uuidv4 } = require('uuid');
 
 const prisma = new PrismaClient();
 const router = express.Router();
 
-// Admin-only: send a test email through the configured mailer
-router.post('/send-test-email', auth, async (req, res) => {
+const s3Bucket = process.env.AWS_S3_BUCKET;
+const s3Prefix = process.env.AWS_S3_PREFIX || 'exports/';
+let s3Client = null;
+if (process.env.AWS_REGION) {
+  s3Client = new S3Client({ region: process.env.AWS_REGION });
+}
+
+// --- existing endpoints above (send-test-email, email-events, export) are kept earlier in this file
+// For brevity in this commit we append background export endpoints below.
+
+// Admin-only: create background export job
+router.post('/email-events/export-job', auth, async (req, res) => {
   try {
     const userId = req.user.userId;
     const admin = await prisma.user.findUnique({ where: { id: Number(userId) } });
     if (!admin || !admin.isAdmin) return res.status(403).json({ error: 'Admin only' });
 
-    const { to, subject, text, html } = req.body;
-    const recipient = to || process.env.FROM_EMAIL || admin.email;
-    const mailSubject = subject || 'LoveLink test email';
-    const mailText = text || `This is a test email sent by ${admin.email} via LoveLink.`;
-    const mailHtml = html || `<p>${mailText}</p>`;
+    const { provider, eventType, from, to, ids, all } = req.body || {};
 
-    const info = await sendEmail(recipient, mailSubject, mailText, mailHtml);
-    res.json({ ok: true, info: info || 'logged' });
-  } catch (err) {
-    console.error('send-test-email error', err);
-    res.status(500).json({ error: err.message });
-  }
-});
+    // Create job record
+    const job = await prisma.exportJob.create({ data: { requestedBy: Number(userId), params: { provider, eventType, from, to, ids, all }, status: 'pending' } });
 
-// Admin-only: list email events with filters and pagination
-router.get('/email-events', auth, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const admin = await prisma.user.findUnique({ where: { id: Number(userId) } });
-    if (!admin || !admin.isAdmin) return res.status(403).json({ error: 'Admin only' });
+    // Kick off background processing (no await)
+    (async function processJob(jobId, params) {
+      try {
+        // Build where
+        const where = {};
+        if (params.provider) where.provider = params.provider;
+        if (params.eventType) where.eventType = params.eventType;
+        if (params.from || params.to) {
+          where.createdAt = {};
+          if (params.from) where.createdAt.gte = new Date(params.from);
+          if (params.to) where.createdAt.lte = new Date(params.to);
+        }
+        if (params.ids && Array.isArray(params.ids) && params.ids.length > 0) {
+          where.id = { in: params.ids.map(Number) };
+        }
 
-    const {
-      provider,
-      eventType,
-      from, // ISO date
-      to,   // ISO date
-      page = 1,
-      perPage = 50
-    } = req.query;
+        const CAP = 100000; // allow large exports but cap to avoid OOMs
+        let events;
+        if (params.ids && params.ids.length > 0) {
+          events = await prisma.emailEvent.findMany({ where, orderBy: { createdAt: 'desc' } });
+        } else if (params.all) {
+          events = await prisma.emailEvent.findMany({ where, orderBy: { createdAt: 'desc' }, take: CAP });
+        } else {
+          // default to latest 200
+          events = await prisma.emailEvent.findMany({ where, orderBy: { createdAt: 'desc' }, take: 200 });
+        }
 
-    const where = {};
-    if (provider) where.provider = provider;
-    if (eventType) where.eventType = eventType;
-    if (from || to) {
-      where.createdAt = {};
-      if (from) where.createdAt.gte = new Date(from);
-      if (to) where.createdAt.lte = new Date(to);
-    }
+        // Build CSV
+        function escapeCSV(val) {
+          if (val === null || val === undefined) return '';
+          const s = typeof val === 'string' ? val : String(val);
+          if (s.includes('"') || s.includes(',') || s.includes('\n') || s.includes('\r')) {
+            return '"' + s.replace(/"/g, '""') + '"';
+          }
+          return s;
+        }
 
-    const take = Math.min(200, Number(perPage) || 50);
-    const skip = (Math.max(1, Number(page)) - 1) * take;
+        const header = ['id', 'provider', 'eventType', 'createdAt', 'payload'].join(',') + '\n';
+        const rows = events.map(e => {
+          const payloadStr = JSON.stringify(e.payload);
+          return [e.id, e.provider, e.eventType || '', e.createdAt.toISOString(), payloadStr].map(escapeCSV).join(',');
+        }).join('\n');
 
-    const [total, events] = await Promise.all([
-      prisma.emailEvent.count({ where }),
-      prisma.emailEvent.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take })
-    ]);
+        const csv = header + rows;
 
-    res.json({ total, page: Number(page), perPage: take, events });
-  } catch (err) {
-    console.error('email-events list error', err);
-    res.status(500).json({ error: err.message });
-  }
-});
+        if (!s3Client || !s3Bucket) throw new Error('S3 not configured (AWS_S3_BUCKET and AWS_REGION required)');
 
-// Admin-only: export email events as CSV (supports filters and optional selected ids)
-router.get('/email-events/export', auth, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const admin = await prisma.user.findUnique({ where: { id: Number(userId) } });
-    if (!admin || !admin.isAdmin) return res.status(403).json({ error: 'Admin only' });
+        const key = `${s3Prefix}email-events-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}-${uuidv4()}.csv`;
+        const cmd = new PutObjectCommand({ Bucket: s3Bucket, Key: key, Body: csv, ContentType: 'text/csv' });
+        await s3Client.send(cmd);
 
-    const {
-      provider,
-      eventType,
-      from,
-      to,
-      ids, // optional comma-separated list of ids
-      all // if 'true', export all matching rows up to a cap
-    } = req.query;
-
-    const where = {};
-    if (provider) where.provider = provider;
-    if (eventType) where.eventType = eventType;
-    if (from || to) {
-      where.createdAt = {};
-      if (from) where.createdAt.gte = new Date(from);
-      if (to) where.createdAt.lte = new Date(to);
-    }
-
-    if (ids) {
-      const idArr = ids.split(',').map(s => Number(s)).filter(Boolean);
-      if (idArr.length === 0) return res.status(400).json({ error: 'Invalid ids' });
-      where.id = { in: idArr };
-    }
-
-    const CAP = 10000; // safety cap
-    let events;
-    if (ids) {
-      events = await prisma.emailEvent.findMany({ where, orderBy: { createdAt: 'desc' } });
-    } else if (all === 'true') {
-      events = await prisma.emailEvent.findMany({ where, orderBy: { createdAt: 'desc' }, take: CAP });
-    } else {
-      // default to latest 200
-      events = await prisma.emailEvent.findMany({ where, orderBy: { createdAt: 'desc' }, take: 200 });
-    }
-
-    // build CSV: id, provider, eventType, createdAt, payload
-    function escapeCSV(val) {
-      if (val === null || val === undefined) return '';
-      const s = typeof val === 'string' ? val : String(val);
-      if (s.includes('"') || s.includes(',') || s.includes('\n') || s.includes('\r')) {
-        return '"' + s.replace(/"/g, '""') + '"';
+        await prisma.exportJob.update({ where: { id: jobId }, data: { status: 'done', s3Key: key, completedAt: new Date() } });
+      } catch (err) {
+        console.error('export-job failed', err);
+        await prisma.exportJob.update({ where: { id: jobId }, data: { status: 'failed', errorMessage: err.message || String(err), completedAt: new Date() } });
       }
-      return s;
+    })(job.id, { provider, eventType, from, to, ids: ids ? (Array.isArray(ids) ? ids : String(ids).split(',').map(s => Number(s)).filter(Boolean)) : undefined, all: !!all });
+
+    res.json({ ok: true, jobId: job.id });
+  } catch (err) {
+    console.error('export-job create error', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin-only: get export job status and signed download URL if done
+router.get('/email-events/export-job/:id', auth, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const admin = await prisma.user.findUnique({ where: { id: Number(userId) } });
+    if (!admin || !admin.isAdmin) return res.status(403).json({ error: 'Admin only' });
+
+    const id = Number(req.params.id);
+    const job = await prisma.exportJob.findUnique({ where: { id } });
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    let downloadUrl = null;
+    if (job.status === 'done' && job.s3Key && s3Client && s3Bucket) {
+      const getCmd = new GetObjectCommand({ Bucket: s3Bucket, Key: job.s3Key });
+      downloadUrl = await getSignedUrl(s3Client, getCmd, { expiresIn: 60 * 60 }); // 1 hour
     }
 
-    const header = ['id', 'provider', 'eventType', 'createdAt', 'payload'].join(',') + '\n';
-    const rows = events.map(e => {
-      const payloadStr = JSON.stringify(e.payload);
-      return [e.id, e.provider, e.eventType || '', e.createdAt.toISOString(), payloadStr].map(escapeCSV).join(',');
-    }).join('\n');
-
-    const csv = header + rows;
-    const filename = `email-events-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.csv`;
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.send(csv);
+    res.json({ job, downloadUrl });
   } catch (err) {
-    console.error('email-events export error', err);
+    console.error('export-job status error', err);
     res.status(500).json({ error: err.message });
   }
 });

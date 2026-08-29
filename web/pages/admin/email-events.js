@@ -18,6 +18,7 @@ export default function EmailEventsAdmin() {
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState({});
   const [selectAll, setSelectAll] = useState(false);
+  const [exportJob, setExportJob] = useState(null);
   const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
 
   const buildQuery = () => {
@@ -115,6 +116,45 @@ export default function EmailEventsAdmin() {
     URL.revokeObjectURL(href);
   };
 
+  // New: trigger background S3 export (selected or all filtered)
+  const triggerExportToS3 = async (useSelected = false) => {
+    const body = {};
+    if (useSelected) {
+      const ids = Object.keys(selected).filter(k => selected[k]).map(k => Number(k));
+      if (ids.length === 0) return alert('No events selected');
+      body.ids = ids;
+    } else {
+      if (provider) body.provider = provider;
+      if (eventType) body.eventType = eventType;
+      if (from) body.from = from;
+      if (to) body.to = to;
+      body.all = true;
+    }
+
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/admin/email-events/export-job`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || 'Failed to create export job');
+      setExportJob({ id: json.jobId, status: 'pending' });
+      // poll for status
+      const poll = setInterval(async () => {
+        try {
+          const r = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/admin/email-events/export-job/${json.jobId}`, { headers: { Authorization: `Bearer ${token}` } });
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.error || 'Failed to get job');
+          setExportJob({ id: json.jobId, ...j.job });
+          if (j.job.status !== 'pending') clearInterval(poll);
+        } catch (e) {
+          console.error('poll error', e);
+          clearInterval(poll);
+        }
+      }, 3000);
+    } catch (e) {
+      console.error(e);
+      alert('Failed to start export job: ' + e.message);
+    }
+  };
+
   return (
     <main style={{ padding: 24 }}>
       <h1>Admin: Email Events</h1>
@@ -146,7 +186,21 @@ export default function EmailEventsAdmin() {
         </label>
         <button onClick={exportSelected}>Export selected CSV</button>
         <button onClick={exportAllFiltered}>Export all filtered CSV (max 10k)</button>
+        <button onClick={() => triggerExportToS3(true)}>Background Export selected to S3</button>
+        <button onClick={() => triggerExportToS3(false)}>Background Export all filtered to S3</button>
       </div>
+
+      {exportJob && (
+        <div style={{ marginBottom: 12, padding: 12, border: '1px solid #eee' }}>
+          <div><strong>Export Job #{exportJob.id}</strong> — Status: {exportJob.status}</div>
+          {exportJob.status === 'done' && exportJob.s3Key && (
+            <div style={{ marginTop: 8 }}>
+              <a href={`/api/admin/email-events/export-job/${exportJob.id}?download=true`} target="_blank" rel="noreferrer">Download (signed URL)</a>
+            </div>
+          )}
+          {exportJob.status === 'failed' && <div style={{ color: 'red' }}>Error: {exportJob.errorMessage}</div>}
+        </div>
+      )}
 
       {loading ? <div>Loading...</div> : (
         <div style={{ border: '1px solid #eee', borderRadius: 6, overflow: 'hidden' }}>

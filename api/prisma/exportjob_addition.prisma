@@ -1,0 +1,10 @@
+model ExportJob {
+  id          Int      @id @default(autoincrement())
+  requestedBy Int
+  params      Json
+  status      String   @default("pending")
+  s3Key       String?
+  errorMessage String?
+  createdAt   DateTime @default(now())
+  completedAt DateTime?
+}
