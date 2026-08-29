@@ -1,4 +1,4 @@
-// LoveLink API entrypoint: auth, plans, paypal, payouts
+// LoveLink API entrypoint: auth, plans, paypal, payouts, creator, admin
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -16,6 +16,8 @@ app.use('/api/auth', authRouter);
 app.use('/api/plans', plansRouter);
 app.use('/api/paypal', paypalRouter);
 app.use('/api/payouts', require('./routes/payouts'));
+app.use('/api/creator', require('./routes/creator'));
+app.use('/api/admin', require('./routes/admin'));
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
