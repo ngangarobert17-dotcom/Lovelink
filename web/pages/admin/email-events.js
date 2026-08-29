@@ -16,6 +16,8 @@ export default function EmailEventsAdmin() {
   const [perPage, setPerPage] = useState(50);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [selected, setSelected] = useState({});
+  const [selectAll, setSelectAll] = useState(false);
   const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
 
   const buildQuery = () => {
@@ -38,6 +40,9 @@ export default function EmailEventsAdmin() {
       if (!res.ok) throw new Error(json.error || 'Failed to load');
       setEvents(json.events || []);
       setTotal(json.total || 0);
+      // reset selection
+      setSelected({});
+      setSelectAll(false);
     } catch (e) {
       console.error(e);
       alert('Failed to load email events: ' + e.message);
@@ -49,6 +54,66 @@ export default function EmailEventsAdmin() {
   useEffect(() => { if (token) load(); }, [token, page, perPage]);
 
   const onSearch = (e) => { e.preventDefault(); setPage(1); load(); };
+
+  const toggleSelect = (id) => setSelected(prev => ({ ...prev, [id]: !prev[id] }));
+
+  const toggleSelectAll = () => {
+    if (!selectAll) {
+      const newSel = {};
+      events.forEach(ev => newSel[ev.id] = true);
+      setSelected(newSel);
+      setSelectAll(true);
+    } else {
+      setSelected({});
+      setSelectAll(false);
+    }
+  };
+
+  const exportSelected = async () => {
+    const ids = Object.keys(selected).filter(k => selected[k]).map(k => Number(k));
+    if (ids.length === 0) return alert('No events selected');
+    const qs = new URLSearchParams();
+    qs.set('ids', ids.join(','));
+    const url = `${process.env.NEXT_PUBLIC_API_URL}/api/admin/email-events/export?${qs.toString()}`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) {
+      const json = await res.json();
+      return alert('Export failed: ' + (json.error || res.statusText));
+    }
+    const blob = await res.blob();
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = href;
+    a.download = `email-events-selected-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(href);
+  };
+
+  const exportAllFiltered = async () => {
+    const qs = new URLSearchParams();
+    if (provider) qs.set('provider', provider);
+    if (eventType) qs.set('eventType', eventType);
+    if (from) qs.set('from', from);
+    if (to) qs.set('to', to);
+    qs.set('all', 'true');
+    const url = `${process.env.NEXT_PUBLIC_API_URL}/api/admin/email-events/export?${qs.toString()}`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) {
+      const json = await res.json();
+      return alert('Export failed: ' + (json.error || res.statusText));
+    }
+    const blob = await res.blob();
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = href;
+    a.download = `email-events-all-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(href);
+  };
 
   return (
     <main style={{ padding: 24 }}>
@@ -75,14 +140,25 @@ export default function EmailEventsAdmin() {
         </div>
       </div>
 
+      <div style={{ marginBottom: 12, display: 'flex', gap: 8 }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <input type="checkbox" checked={selectAll} onChange={toggleSelectAll} /> Select all on page
+        </label>
+        <button onClick={exportSelected}>Export selected CSV</button>
+        <button onClick={exportAllFiltered}>Export all filtered CSV (max 10k)</button>
+      </div>
+
       {loading ? <div>Loading...</div> : (
         <div style={{ border: '1px solid #eee', borderRadius: 6, overflow: 'hidden' }}>
           {events.length === 0 ? <div style={{ padding: 16 }}>No events</div> : events.map(ev => (
             <div key={ev.id} style={{ padding: 12, borderBottom: '1px solid #f1f1f1' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <div>
-                  <div><strong>{ev.provider}</strong> — {ev.eventType || 'n/a'}</div>
-                  <div style={{ fontSize: 12, color: '#666' }}>{new Date(ev.createdAt).toLocaleString()}</div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                  <input type="checkbox" checked={!!selected[ev.id]} onChange={() => toggleSelect(ev.id)} />
+                  <div>
+                    <div><strong>{ev.provider}</strong> — {ev.eventType || 'n/a'}</div>
+                    <div style={{ fontSize: 12, color: '#666' }}>{new Date(ev.createdAt).toLocaleString()}</div>
+                  </div>
                 </div>
                 <div style={{ minWidth: 160, textAlign: 'right' }}>
                   <div>ID: {ev.id}</div>

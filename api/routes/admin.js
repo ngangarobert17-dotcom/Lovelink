@@ -67,4 +67,73 @@ router.get('/email-events', auth, async (req, res) => {
   }
 });
 
+// Admin-only: export email events as CSV (supports filters and optional selected ids)
+router.get('/email-events/export', auth, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const admin = await prisma.user.findUnique({ where: { id: Number(userId) } });
+    if (!admin || !admin.isAdmin) return res.status(403).json({ error: 'Admin only' });
+
+    const {
+      provider,
+      eventType,
+      from,
+      to,
+      ids, // optional comma-separated list of ids
+      all // if 'true', export all matching rows up to a cap
+    } = req.query;
+
+    const where = {};
+    if (provider) where.provider = provider;
+    if (eventType) where.eventType = eventType;
+    if (from || to) {
+      where.createdAt = {};
+      if (from) where.createdAt.gte = new Date(from);
+      if (to) where.createdAt.lte = new Date(to);
+    }
+
+    if (ids) {
+      const idArr = ids.split(',').map(s => Number(s)).filter(Boolean);
+      if (idArr.length === 0) return res.status(400).json({ error: 'Invalid ids' });
+      where.id = { in: idArr };
+    }
+
+    const CAP = 10000; // safety cap
+    let events;
+    if (ids) {
+      events = await prisma.emailEvent.findMany({ where, orderBy: { createdAt: 'desc' } });
+    } else if (all === 'true') {
+      events = await prisma.emailEvent.findMany({ where, orderBy: { createdAt: 'desc' }, take: CAP });
+    } else {
+      // default to latest 200
+      events = await prisma.emailEvent.findMany({ where, orderBy: { createdAt: 'desc' }, take: 200 });
+    }
+
+    // build CSV: id, provider, eventType, createdAt, payload
+    function escapeCSV(val) {
+      if (val === null || val === undefined) return '';
+      const s = typeof val === 'string' ? val : String(val);
+      if (s.includes('"') || s.includes(',') || s.includes('\n') || s.includes('\r')) {
+        return '"' + s.replace(/"/g, '""') + '"';
+      }
+      return s;
+    }
+
+    const header = ['id', 'provider', 'eventType', 'createdAt', 'payload'].join(',') + '\n';
+    const rows = events.map(e => {
+      const payloadStr = JSON.stringify(e.payload);
+      return [e.id, e.provider, e.eventType || '', e.createdAt.toISOString(), payloadStr].map(escapeCSV).join(',');
+    }).join('\n');
+
+    const csv = header + rows;
+    const filename = `email-events-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.csv`;
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+  } catch (err) {
+    console.error('email-events export error', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
