@@ -1,0 +1,97 @@
+// Prisma schema (extended)
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int       @id @default(autoincrement())
+  email     String    @unique
+  password  String
+  isAdmin   Boolean   @default(false)
+  createdAt DateTime  @default(now())
+  purchases Purchase[]
+  payouts   PayoutRequest[]
+}
+
+model Plan {
+  id          Int      @id @default(autoincrement())
+  externalId  String   @unique
+  name        String
+  price       Float
+  currency    String   @default("KES")
+  interval    String?
+  description String?
+  createdAt   DateTime @default(now())
+  purchases   Purchase[]
+}
+
+model Purchase {
+  id         Int      @id @default(autoincrement())
+  userId     Int?
+  planId     Int?
+  amount     Float
+  currency   String
+  provider   String
+  providerId String
+  status     String
+  createdAt  DateTime @default(now())
+  user       User?    @relation(fields: [userId], references: [id])
+  plan       Plan?    @relation(fields: [planId], references: [id])
+}
+
+model CreatorEarning {
+  id           Int      @id @default(autoincrement())
+  creatorId    Int
+  amount       Float
+  platformCut  Float
+  payoutId     Int?
+  createdAt    DateTime @default(now())
+}
+
+model Gift {
+  id        Int      @id @default(autoincrement())
+  senderId  Int
+  receiverId Int
+  amount    Float
+  coinsUsed Int
+  createdAt DateTime @default(now())
+}
+
+model LiveSession {
+  id        Int      @id @default(autoincrement())
+  creatorId Int
+  title     String?
+  viewers   Int      @default(0)
+  startedAt DateTime?
+  endedAt   DateTime?
+}
+
+model CoinTransaction {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  delta     Int
+  reason    String?
+  createdAt DateTime @default(now())
+}
+
+model PayoutRequest {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  amount    Float
+  status    String   @default("pending")
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+model Report {
+  id        Int      @id @default(autoincrement())
+  reporterId Int
+  targetId  Int
+  reason    String?
+  createdAt DateTime @default(now())
+}
