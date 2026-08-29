@@ -2,6 +2,7 @@ const express = require('express');
 const { PrismaClient } = require('@prisma/client');
 const auth = require('../middleware/auth');
 const fetch = require('node-fetch');
+const sendEmail = require('../utils/mailer');
 
 const prisma = new PrismaClient();
 const router = express.Router();
@@ -87,6 +88,19 @@ router.post('/request', auth, async (req, res) => {
       data: { userId: Number(userId), amount: Number(amount), status: 'pending' }
     });
 
+    // notify creator via email
+    try {
+      const user = await prisma.user.findUnique({ where: { id: Number(userId) } });
+      if (user && user.email) {
+        await sendEmail(user.email, 'LoveLink: Payout request received',
+          `We received your payout request (ID: ${payout.id}) for KSh ${payout.amount}. We will review and notify you when it is approved.`,
+          `<p>We received your payout request (ID: <strong>${payout.id}</strong>) for <strong>KSh ${payout.amount}</strong>. We will review and notify you when it is approved.</p>`
+        );
+      }
+    } catch (e) {
+      console.error('Failed to send payout request email', e);
+    }
+
     res.json(payout);
   } catch (err) {
     console.error(err);
@@ -127,6 +141,20 @@ router.post('/:id/approve', auth, async (req, res) => {
     if (payout.status !== 'pending') return res.status(400).json({ error: 'Payout must be pending' });
 
     const updated = await prisma.payoutRequest.update({ where: { id }, data: { status: 'approved' } });
+
+    // notify creator via email
+    try {
+      const user = await prisma.user.findUnique({ where: { id: Number(updated.userId) } });
+      if (user && user.email) {
+        await sendEmail(user.email, 'LoveLink: Payout approved',
+          `Your payout request (ID: ${updated.id}) for KSh ${updated.amount} has been approved. It will be sent shortly.`,
+          `<p>Your payout request (ID: <strong>${updated.id}</strong>) for <strong>KSh ${updated.amount}</strong> has been approved. It will be sent shortly.</p>`
+        );
+      }
+    } catch (e) {
+      console.error('Failed to send payout approved email', e);
+    }
+
     res.json(updated);
   } catch (err) {
     console.error(err);
@@ -151,11 +179,39 @@ router.post('/:id/mark-paid', auth, async (req, res) => {
       const batchId = await sendPayPalPayout(payout);
 
       const updated = await prisma.payoutRequest.update({ where: { id }, data: { status: 'paid', provider: 'paypal', providerId: batchId || undefined, paidAt: new Date() } });
+
+      // Notify creator of successful payout
+      try {
+        const user = await prisma.user.findUnique({ where: { id: Number(updated.userId) } });
+        if (user && user.email) {
+          await sendEmail(user.email, 'LoveLink: Payout sent',
+            `Your payout request (ID: ${updated.id}) for KSh ${updated.amount} has been sent. PayPal batch id: ${updated.providerId || 'N/A'}.`,
+            `<p>Your payout request (ID: <strong>${updated.id}</strong>) for <strong>KSh ${updated.amount}</strong> has been sent. PayPal batch id: <strong>${updated.providerId || 'N/A'}</strong>.</p>`
+          );
+        }
+      } catch (e) {
+        console.error('Failed to send payout sent email', e);
+      }
+
       return res.json(updated);
     } catch (pErr) {
       console.error('PayPal payout failed', pErr);
       // mark as failed and store error info if possible
       await prisma.payoutRequest.update({ where: { id }, data: { status: 'failed' } });
+
+      // Notify creator of failure
+      try {
+        const user = await prisma.user.findUnique({ where: { id: Number(payout.userId) } });
+        if (user && user.email) {
+          await sendEmail(user.email, 'LoveLink: Payout failed',
+            `We attempted to send your payout request (ID: ${payout.id}) for KSh ${payout.amount} but it failed. The admin will review and retry.`,
+            `<p>We attempted to send your payout request (ID: <strong>${payout.id}</strong>) for <strong>KSh ${payout.amount}</strong> but it failed. The admin will review and retry.</p>`
+          );
+        }
+      } catch (e) {
+        console.error('Failed to send payout failed email', e);
+      }
+
       return res.status(500).json({ error: 'PayPal payout failed', details: pErr.details || pErr.message });
     }
   } catch (err) {
